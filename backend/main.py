@@ -5,7 +5,7 @@ from urllib.parse import urlencode
 from dotenv import load_dotenv
 from datetime import datetime
 from sqlalchemy import select
-
+from analytics import AnalyticsEngine
 import requests
 import os
 
@@ -366,3 +366,153 @@ async def get_history(endpoint: str, user_id: str = "default", db=Depends(get_db
     )
     rows = result.scalars().all()
     return [r.snapshot for r in rows]
+
+
+@app.get("/analytics/dashboard")
+async def analytics_dashboard(user_id: str = "default", db=Depends(get_db)):
+
+    videos_data = await analytics_videos(user_id=user_id, db=db)
+
+
+    rows = videos_data.get("rows", [])
+
+    if not rows:
+        return {
+            "channelHealth": 0,
+            "videos": []
+        }
+
+    videos = []
+
+    for row in rows:
+
+        videos.append({
+            "video_id": row[0],
+            "views": float(row[1] or 0),
+            "likes": float(row[2] or 0),
+            "comments": float(row[3] or 0),
+            "estimatedMinutesWatched": float(row[4] or 0),
+            "averageViewDuration": float(row[5] or 0),
+            "averageViewPercentage": float(row[6] or 0),
+            "subscribersGained": float(row[7] or 0),
+        })
+
+    avg_views = (
+        sum(v["views"] for v in videos)
+        / len(videos)
+    )
+
+    avg_retention = (
+        sum(v["averageViewPercentage"] for v in videos)
+        / len(videos)
+    )
+
+    avg_engagement = (
+        sum(
+            AnalyticsEngine.engagement_rate(
+                v["views"],
+                v["likes"],
+                v["comments"]
+            )
+            for v in videos
+        )
+        / len(videos)
+    )
+
+    avg_sub_conversion = (
+        sum(
+            AnalyticsEngine.subscriber_conversion(
+                v["views"],
+                v["subscribersGained"]
+            )
+            for v in videos
+        )
+        / len(videos)
+    )
+
+    insight_videos = []
+
+    for video in videos:
+
+        engagement = AnalyticsEngine.engagement_rate(
+            video["views"],
+            video["likes"],
+            video["comments"]
+        )
+
+        sub_conversion = (
+            AnalyticsEngine.subscriber_conversion(
+                video["views"],
+                video["subscribersGained"]
+            )
+        )
+
+        relative_views = (
+            AnalyticsEngine.relative_score(
+                video["views"],
+                avg_views
+            )
+        )
+
+        relative_retention = (
+            AnalyticsEngine.relative_score(
+                video["averageViewPercentage"],
+                avg_retention
+            )
+        )
+
+        relative_engagement = (
+            AnalyticsEngine.relative_score(
+                engagement,
+                avg_engagement
+            )
+        )
+
+        relative_subscribers = (
+            AnalyticsEngine.relative_score(
+                sub_conversion,
+                avg_sub_conversion
+            )
+        )
+
+        health_score = (
+            AnalyticsEngine.video_health_score(
+                relative_views,
+                relative_retention,
+                relative_engagement,
+                relative_subscribers
+            )
+        )
+
+        viral_probability = (
+            AnalyticsEngine.viral_probability(
+                relative_views,
+                relative_retention,
+                relative_engagement
+            )
+        )
+
+        insight_videos.append({
+            "video_id": video["video_id"],
+            "healthScore": health_score,
+            "viralProbability": viral_probability,
+            "relativeViews": round(relative_views, 2),
+            "relativeRetention": round(relative_retention, 2),
+            "relativeEngagement": round(relative_engagement, 2),
+            "relativeSubscribers": round(relative_subscribers, 2),
+        })
+
+    channel_health = AnalyticsEngine.channel_health(
+        avg_retention,
+        avg_engagement,
+        0.10,
+        avg_sub_conversion
+    )
+
+    return {
+        "channelHealth": channel_health,
+        "averageViews": round(avg_views),
+        "averageRetention": round(avg_retention, 2),
+        "averageEngagement": round(avg_engagement, 4),
+        "videos": insight_videos,
+    }
