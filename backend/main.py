@@ -1,9 +1,18 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from urllib.parse import urlencode
+from dotenv import load_dotenv
+from datetime import datetime
+from sqlalchemy import select
+
 import requests
 import os
-from datetime import datetime
+
+from database import get_db
+from models import UserToken, AnalyticsSnapshot
+
+load_dotenv()
 
 app = FastAPI()
 
@@ -19,13 +28,32 @@ CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 REDIRECT_URI = "http://localhost:8000/auth/callback"
 
-SCOPES = "https://www.googleapis.com/auth/yt-analytics.readonly"
+SCOPES = (
+    "https://www.googleapis.com/auth/yt-analytics.readonly "
+    "https://www.googleapis.com/auth/youtube.readonly"
+)
 
-USER_TOKENS = {}
+
+# --------------------------------------------------
+# SAVE SNAPSHOT HELPER
+# --------------------------------------------------
+
+async def save_snapshot(db, user_id, endpoint, data):
+    snapshot = AnalyticsSnapshot(
+        user_id=user_id,
+        endpoint=endpoint,
+        snapshot=data
+    )
+    db.add(snapshot)
+    await db.commit()
+
+
+# --------------------------------------------------
+# AUTH
+# --------------------------------------------------
 
 @app.get("/auth/login")
-def login(user_id: str = "default"):
-    # Pass user_id into the 'state' parameter so Google sends it back to us
+async def login(user_id: str = "default"):
     params = {
         "client_id": CLIENT_ID,
         "redirect_uri": REDIRECT_URI,
@@ -33,89 +61,308 @@ def login(user_id: str = "default"):
         "scope": SCOPES,
         "access_type": "offline",
         "prompt": "consent",
-        "state": user_id  
+        "state": user_id,
     }
-    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
-    return {"auth_url": url}
+
+    return {
+        "auth_url":
+            "https://accounts.google.com/o/oauth2/v2/auth?"
+            + urlencode(params)
+    }
+
 
 @app.get("/auth/callback")
-def callback(code: str, state: str = "default"):
-    # Google returns the 'user_id' inside the 'state' parameter
-    user_id = state 
+async def callback(code: str, state: str = "default", db=Depends(get_db)):
     token_url = "https://oauth2.googleapis.com/token"
 
-    data = {
-        "code": code,
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "redirect_uri": REDIRECT_URI,
-        "grant_type": "authorization_code"
-    }
-
-    r = requests.post(token_url, data=data)
-    tokens = r.json()
-
-    if "access_token" not in tokens:
-        raise HTTPException(status_code=400, detail=f"Token exchange failed: {tokens}")
-
-    if user_id in USER_TOKENS and "refresh_token" not in tokens:
-        tokens["refresh_token"] = USER_TOKENS[user_id].get("refresh_token")
-
-    USER_TOKENS[user_id] = tokens
-    return {"status": "ok", "tokens_saved_for": user_id}
-
-
-def refresh_token_func(refresh_token):
-    url = "https://oauth2.googleapis.com/token"
-    data = {
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "refresh_token": refresh_token,
-        "grant_type": "refresh_token"
-    }
-    return requests.post(url, data=data).json()
-
-
-@app.get("/youtube/analytics")
-def analytics(user_id: str = "default"):
-    if user_id not in USER_TOKENS:
-        raise HTTPException(status_code=401, detail="User not authenticated")
-
-    tokens = USER_TOKENS[user_id]
-    access_token = tokens["access_token"]
-
-    headers = {"Authorization": f"Bearer {access_token}"}
-
-    # Dynamically getting current year data instead of hardcoded 2023
-    current_year = datetime.now().year
-    params = {
-        "ids": "channel==MINE",
-        "startDate": f"{current_year}-01-01",
-        "endDate": f"{current_year}-12-31",
-        "metrics": "views,likes,subscribersGained",
-        "dimensions": "day",
-        "sort": "day"
-    }
-
-    r = requests.get(
-        "https://youtubeanalytics.googleapis.com/v2/reports",
-        headers=headers,
-        params=params
+    response = requests.post(
+        token_url,
+        data={
+            "code": code,
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "redirect_uri": REDIRECT_URI,
+            "grant_type": "authorization_code",
+        },
     )
 
-    # If expired, refresh and try again
-    if r.status_code == 401 and "refresh_token" in tokens:
-        new_tokens = refresh_token_func(tokens["refresh_token"])
-        
-        if "access_token" in new_tokens:
-            USER_TOKENS[user_id]["access_token"] = new_tokens["access_token"]
-            headers = {"Authorization": f"Bearer {new_tokens['access_token']}"}
-            
-            # Re-assign 'r' so the new valid response is returned
-            r = requests.get(
-                "https://youtubeanalytics.googleapis.com/v2/reports",
-                headers=headers,
-                params=params
-            )
+    tokens = response.json()
 
-    return r.json()
+    if "access_token" not in tokens:
+        raise HTTPException(status_code=400, detail=tokens)
+
+    # Check if user exists
+    result = await db.execute(select(UserToken).where(UserToken.user_id == state))
+    existing = result.scalar_one_or_none()
+
+    # Keep old refresh token if Google doesn't send a new one
+    if existing and "refresh_token" not in tokens:
+        tokens["refresh_token"] = existing.refresh_token
+
+    # Save to DB
+    if existing:
+        existing.access_token = tokens["access_token"]
+        existing.refresh_token = tokens.get("refresh_token")
+        existing.token_data = tokens
+    else:
+        new_user = UserToken(
+            user_id=state,
+            access_token=tokens["access_token"],
+            refresh_token=tokens.get("refresh_token"),
+            token_data=tokens,
+        )
+        db.add(new_user)
+
+    await db.commit()
+
+    return RedirectResponse(f"http://localhost:5173/?auth=ok&user={state}")
+
+
+def refresh_token(refresh_token_value):
+    response = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "refresh_token": refresh_token_value,
+            "grant_type": "refresh_token",
+        },
+    )
+    return response.json()
+
+
+async def authorized_request(user_id, url, params=None, db=None):
+    result = await db.execute(select(UserToken).where(UserToken.user_id == user_id))
+    user = result.scalar_one_or_none()
+
+    if not user:
+        raise HTTPException(status_code=401, detail="User not authenticated")
+
+    headers = {"Authorization": f"Bearer {user.access_token}"}
+
+    response = requests.get(url, headers=headers, params=params)
+
+    # Token expired → refresh
+    if response.status_code == 401 and user.refresh_token:
+        new_tokens = refresh_token(user.refresh_token)
+
+        if "access_token" in new_tokens:
+            user.access_token = new_tokens["access_token"]
+            await db.commit()
+
+            headers["Authorization"] = f"Bearer {new_tokens['access_token']}"
+            response = requests.get(url, headers=headers, params=params)
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail=response.text)
+
+    return response.json()
+
+
+def analytics_dates():
+    year = datetime.now().year
+    return (
+        f"{year}-01-01",
+        datetime.now().strftime("%Y-%m-%d")
+    )
+
+
+# --------------------------------------------------
+# VIDEOS
+# --------------------------------------------------
+
+@app.get("/youtube/videos")
+async def videos(user_id: str = "default", db=Depends(get_db)):
+
+    channel = await authorized_request(
+        user_id,
+        "https://www.googleapis.com/youtube/v3/channels",
+        {"part": "contentDetails", "mine": "true"},
+        db=db
+    )
+
+    uploads_playlist = (
+        channel["items"][0]
+        ["contentDetails"]
+        ["relatedPlaylists"]
+        ["uploads"]
+    )
+
+    data = await authorized_request(
+        user_id,
+        "https://www.googleapis.com/youtube/v3/playlistItems",
+        {
+            "part": "snippet",
+            "playlistId": uploads_playlist,
+            "maxResults": 50,
+        },
+        db=db
+    )
+
+    await save_snapshot(db, user_id, "videos", data)
+    return data
+
+
+# --------------------------------------------------
+# CHANNEL ANALYTICS
+# --------------------------------------------------
+
+@app.get("/youtube/analytics")
+async def analytics(user_id: str = "default", db=Depends(get_db)):
+
+    start_date, end_date = analytics_dates()
+
+    data = await authorized_request(
+        user_id,
+        "https://youtubeanalytics.googleapis.com/v2/reports",
+        {
+            "ids": "channel==MINE",
+            "startDate": start_date,
+            "endDate": end_date,
+            "metrics":
+                "views,likes,comments,estimatedMinutesWatched,"
+                "averageViewDuration,averageViewPercentage,"
+                "subscribersGained,subscribersLost",
+            "dimensions": "day",
+            "sort": "day",
+        },
+        db=db
+    )
+
+    await save_snapshot(db, user_id, "channel_daily", data)
+    return data
+
+
+# --------------------------------------------------
+# VIDEO ANALYTICS
+# --------------------------------------------------
+
+@app.get("/youtube/analytics/videos")
+async def analytics_videos(user_id: str = "default", db=Depends(get_db)):
+
+    start_date, end_date = analytics_dates()
+
+    data = await authorized_request(
+        user_id,
+        "https://youtubeanalytics.googleapis.com/v2/reports",
+        {
+            "ids": "channel==MINE",
+            "startDate": start_date,
+            "endDate": end_date,
+            "metrics":
+                "views,likes,comments,estimatedMinutesWatched,"
+                "averageViewDuration,averageViewPercentage,"
+                "subscribersGained",
+            "dimensions": "video",
+            "sort": "-views",
+            "maxResults": 200,
+        },
+        db=db
+    )
+
+    await save_snapshot(db, user_id, "video_analytics", data)
+    return data
+
+
+# --------------------------------------------------
+# TRAFFIC
+# --------------------------------------------------
+
+@app.get("/youtube/analytics/traffic")
+async def traffic(user_id: str = "default", db=Depends(get_db)):
+
+    start_date, end_date = analytics_dates()
+
+    data = await authorized_request(
+        user_id,
+        "https://youtubeanalytics.googleapis.com/v2/reports",
+        {
+            "ids": "channel==MINE",
+            "startDate": start_date,
+            "endDate": end_date,
+            "metrics": "views",
+            "dimensions": "insightTrafficSourceType",
+            "sort": "-views",
+        },
+        db=db
+    )
+
+    await save_snapshot(db, user_id, "traffic", data)
+    return data
+
+
+# --------------------------------------------------
+# GEO
+# --------------------------------------------------
+
+@app.get("/youtube/analytics/geo")
+async def geo(user_id: str = "default", db=Depends(get_db)):
+
+    start_date, end_date = analytics_dates()
+
+    data = await authorized_request(
+        user_id,
+        "https://youtubeanalytics.googleapis.com/v2/reports",
+        {
+            "ids": "channel==MINE",
+            "startDate": start_date,
+            "endDate": end_date,
+            "metrics": "views",
+            "dimensions": "country",
+            "sort": "-views",
+        },
+        db=db
+    )
+
+    await save_snapshot(db, user_id, "geo", data)
+    return data
+
+
+# --------------------------------------------------
+# DEVICES
+# --------------------------------------------------
+
+@app.get("/youtube/analytics/devices")
+async def devices(user_id: str = "default", db=Depends(get_db)):
+
+    start_date, end_date = analytics_dates()
+
+    data = await authorized_request(
+        user_id,
+        "https://youtubeanalytics.googleapis.com/v2/reports",
+        {
+            "ids": "channel==MINE",
+            "startDate": start_date,
+            "endDate": end_date,
+            "metrics": "views",
+            "dimensions": "deviceType",
+            "sort": "-views",
+        },
+        db=db
+    )
+
+    await save_snapshot(db, user_id, "devices", data)
+    return data
+
+
+@app.get("/analytics/history")
+async def get_all_history(user_id: str = "default", db=Depends(get_db)):
+    result = await db.execute(
+        select(AnalyticsSnapshot)
+        .where(AnalyticsSnapshot.user_id == user_id)
+        .order_by(AnalyticsSnapshot.created_at.desc())
+    )
+    rows = result.scalars().all()
+    return [r.snapshot for r in rows]
+
+
+@app.get("/analytics/history/{endpoint}")
+async def get_history(endpoint: str, user_id: str = "default", db=Depends(get_db)):
+    result = await db.execute(
+        select(AnalyticsSnapshot)
+        .where(AnalyticsSnapshot.user_id == user_id)
+        .where(AnalyticsSnapshot.endpoint == endpoint)
+        .order_by(AnalyticsSnapshot.created_at.desc())
+    )
+    rows = result.scalars().all()
+    return [r.snapshot for r in rows]
